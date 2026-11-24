@@ -31,5 +31,7 @@
 pub mod certificate;
 pub(in crate::ed25519) mod core;
 mod scheme;
+#[cfg(test)]
+mod wycheproof;
 
 pub use scheme::{PrivateKey, PublicKey, Signature};

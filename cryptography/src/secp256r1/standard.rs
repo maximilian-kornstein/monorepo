@@ -216,9 +216,15 @@ impl arbitrary::Arbitrary<'_> for Signature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Signer as _, Verifier as _, secp256r1::common::tests::*};
+    use crate::{
+        Signer as _, Verifier as _,
+        secp256r1::{
+            common::tests::*,
+            wycheproof::{ECDSA_SECP256R1_SHA256_P1363, Outcome},
+        },
+    };
     use commonware_codec::{Copying, DecodeExt, Encode};
-    use p256::elliptic_curve::scalar::IsHigh;
+    use p256::{ecdsa::signature::Verifier as _, elliptic_curve::scalar::IsHigh};
     use rstest::rstest;
 
     const NAMESPACE: &[u8] = b"test-namespace";
@@ -566,6 +572,55 @@ mod tests {
             }
         };
         assert!(expected);
+    }
+
+    #[test]
+    fn test_wycheproof_vectors() {
+        let mut high_s = 0;
+        for vector in ECDSA_SECP256R1_SHA256_P1363 {
+            let public_key = PublicKey(parse_uncompressed_public_key(vector.public_key));
+            let verify = |signature: &Signature| {
+                let valid = public_key.verify_inner(None, vector.message, signature);
+                // Targets without aws-lc-rs verify with p256 instead.
+                let portable = public_key
+                    .0
+                    .key
+                    .verify(vector.message, &signature.signature)
+                    .is_ok();
+                assert_eq!(
+                    portable, valid,
+                    "Wycheproof ECDSA test {} p256",
+                    vector.tc_id
+                );
+                valid
+            };
+            let signature = Signature::decode(Copying(vector.signature));
+            match vector.result {
+                Outcome::Valid => {
+                    let raw = p256::ecdsa::Signature::from_slice(vector.signature).unwrap();
+                    // BIP 62 rejects the high-s form that Wycheproof accepts.
+                    if raw.s().is_high().into() {
+                        assert!(signature.is_err(), "Wycheproof ECDSA test {}", vector.tc_id);
+                        assert!(verify(&Signature::try_from(raw.normalize_s()).unwrap()));
+                        high_s += 1;
+                    } else {
+                        assert!(
+                            verify(&signature.unwrap()),
+                            "Wycheproof ECDSA test {} {:?}",
+                            vector.tc_id,
+                            vector.flags
+                        );
+                    }
+                }
+                Outcome::Invalid => assert!(
+                    !signature.is_ok_and(|signature| verify(&signature)),
+                    "Wycheproof ECDSA test {} {:?}",
+                    vector.tc_id,
+                    vector.flags
+                ),
+            }
+        }
+        assert_eq!(high_s, WYCHEPROOF_HIGH_S_VALID);
     }
 
     #[cfg(feature = "arbitrary")]

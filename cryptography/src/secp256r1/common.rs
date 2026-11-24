@@ -349,7 +349,7 @@ pub(crate) use impl_public_key_wrapper;
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use commonware_codec::DecodeExt;
+    use commonware_codec::{Copying, DecodeExt};
 
     pub fn create_private_key() -> PrivateKeyInner {
         const HEX: &str = "519b423d715f8b581f4fa8ee59f4771a5b44c8130b4e3eacca54a56dda72b464";
@@ -393,6 +393,18 @@ pub(crate) mod tests {
         uncompressed_public_key.extend_from_slice(&qx);
         uncompressed_public_key.extend_from_slice(&qy);
         uncompressed_public_key
+    }
+
+    // Wycheproof valid vectors with a high `s`: decoding rejects them, but their low-s twins verify.
+    pub const WYCHEPROOF_HIGH_S_VALID: usize = 70;
+
+    pub fn parse_uncompressed_public_key(uncompressed: &[u8]) -> PublicKeyInner {
+        let mut compressed = [0u8; PUBLIC_KEY_LENGTH];
+        compressed[0] = 0x02 | (uncompressed[64] & 1);
+        compressed[1..].copy_from_slice(&uncompressed[1..33]);
+        let public_key = PublicKeyInner::decode(Copying(&compressed)).unwrap();
+        assert_eq!(public_key.key.to_sec1_point(false).as_bytes(), uncompressed);
+        public_key
     }
 
     pub fn padding_odd_length_hex(value: &str) -> String {

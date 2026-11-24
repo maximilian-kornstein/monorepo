@@ -39,3 +39,5 @@ pub mod certificate;
 mod common;
 pub mod recoverable;
 pub mod standard;
+#[cfg(test)]
+mod wycheproof;

@@ -356,10 +356,13 @@ impl arbitrary::Arbitrary<'_> for Signature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Signer as _;
+    use crate::{
+        Signer as _,
+        ed25519::wycheproof::{ED25519, Outcome},
+    };
     #[cfg(not(feature = "std"))]
     use alloc::vec::Vec;
-    use commonware_codec::{DecodeExt, Encode};
+    use commonware_codec::{Copying, DecodeExt, Encode};
     use commonware_math::algebra::Random;
     use commonware_parallel::{Sequential, mocks::explore};
     use commonware_utils::test_rng;
@@ -918,6 +921,60 @@ mod tests {
         }
         let bad_signature = Signature::decode(bad_signature).unwrap();
         assert!(!public_key.verify_inner(None, &message, &bad_signature));
+    }
+
+    // ZIP215 accepts this non-canonical encoding of the identity as R, which RFC 8032 rejects.
+    const WYCHEPROOF_ZIP215_ACCEPTED: &[u16] = &[151];
+
+    #[test]
+    fn wycheproof_test_vectors() {
+        for vector in ED25519 {
+            let expected = match vector.result {
+                Outcome::Valid => true,
+                // ZIP215 accepts small-order and mixed-order keys that satisfy the cofactored equation.
+                Outcome::Acceptable => {
+                    assert!(
+                        matches!(
+                            vector.flags,
+                            ["SmallOrderPublicKey"] | ["MixedOrderPublicKey"]
+                        ),
+                        "Wycheproof Ed25519 test {}",
+                        vector.tc_id
+                    );
+                    true
+                }
+                Outcome::Invalid => WYCHEPROOF_ZIP215_ACCEPTED.contains(&vector.tc_id),
+            };
+            let public_key = PublicKey::decode(Copying(vector.public_key)).unwrap();
+            let valid = Signature::decode(Copying(vector.signature)).is_ok_and(|signature| {
+                let valid = public_key.verify_inner(None, vector.message, &signature);
+                let batch = ed_core::batch::verify_projected(
+                    &mut test_rng(),
+                    &[(&public_key, &signature)],
+                    |_, (public_key, signature)| {
+                        (
+                            &public_key.key,
+                            ed_core::Signature::from(signature.raw),
+                            None,
+                            vector.message,
+                        )
+                    },
+                    &Sequential,
+                )
+                .is_ok();
+                assert_eq!(
+                    batch, valid,
+                    "Wycheproof Ed25519 test {} batch",
+                    vector.tc_id
+                );
+                valid
+            });
+            assert_eq!(
+                valid, expected,
+                "Wycheproof Ed25519 test {} {:?}",
+                vector.tc_id, vector.flags
+            );
+        }
     }
 
     #[test]

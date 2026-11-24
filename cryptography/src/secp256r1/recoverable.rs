@@ -242,7 +242,13 @@ impl arbitrary::Arbitrary<'_> for Signature {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Recoverable, Signer as _, Verifier as _, secp256r1::common::tests::*};
+    use crate::{
+        Recoverable, Signer as _, Verifier as _,
+        secp256r1::{
+            common::tests::*,
+            wycheproof::{ECDSA_SECP256R1_SHA256_P1363, Outcome},
+        },
+    };
     use commonware_codec::{Copying, DecodeExt, Encode};
     use ecdsa::RecoveryId;
     use p256::elliptic_curve::scalar::IsHigh;
@@ -678,6 +684,61 @@ mod tests {
             }
         };
         assert!(expected);
+    }
+
+    #[test]
+    fn test_wycheproof_vectors() {
+        let mut high_s = 0;
+        for vector in ECDSA_SECP256R1_SHA256_P1363 {
+            let public_key = PublicKey(parse_uncompressed_public_key(vector.public_key));
+            // Wycheproof signatures carry no recovery ID, so try each one.
+            let signatures: Vec<_> = (0..4u8)
+                .filter_map(|recovery_id| {
+                    let mut raw = vec![recovery_id];
+                    raw.extend_from_slice(vector.signature);
+                    Signature::decode(Copying(&raw)).ok()
+                })
+                .collect();
+            let recovered = signatures
+                .iter()
+                .filter(|signature| public_key.verify_inner(None, vector.message, signature))
+                .count();
+            match vector.result {
+                Outcome::Valid => {
+                    let raw = p256::ecdsa::Signature::from_slice(vector.signature).unwrap();
+                    // BIP 62 rejects the high-s form that Wycheproof accepts.
+                    if raw.s().is_high().into() {
+                        assert!(
+                            signatures.is_empty(),
+                            "Wycheproof ECDSA test {}",
+                            vector.tc_id
+                        );
+                        let normalized = raw.normalize_s();
+                        let recovery_id = RecoveryId::trial_recovery_from_msg(
+                            &public_key.0.key,
+                            vector.message,
+                            &normalized,
+                        )
+                        .unwrap();
+                        let signature = Signature::new(normalized, recovery_id);
+                        assert!(public_key.verify_inner(None, vector.message, &signature));
+                        high_s += 1;
+                    } else {
+                        assert_eq!(
+                            recovered, 1,
+                            "Wycheproof ECDSA test {} {:?}",
+                            vector.tc_id, vector.flags
+                        );
+                    }
+                }
+                Outcome::Invalid => assert_eq!(
+                    recovered, 0,
+                    "Wycheproof ECDSA test {} {:?}",
+                    vector.tc_id, vector.flags
+                ),
+            }
+        }
+        assert_eq!(high_s, WYCHEPROOF_HIGH_S_VALID);
     }
 
     #[cfg(feature = "arbitrary")]

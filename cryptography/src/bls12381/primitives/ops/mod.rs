@@ -21,6 +21,8 @@
 pub mod aggregate;
 pub mod batch;
 pub mod threshold;
+#[cfg(test)]
+mod wycheproof;
 
 use super::{
     Error,
@@ -127,13 +129,19 @@ pub fn verify_proof_of_possession<V: Variant>(
 #[cfg(test)]
 #[allow(clippy::type_complexity)]
 mod tests {
-    use super::*;
+    use super::{
+        wycheproof::{
+            BLS_SIG_G2_BASIC, BLS_SIG_G2_BASIC_DST, BLS_SIG_G2_POP, BLS_SIG_G2_POP_DST, Outcome,
+            Vector,
+        },
+        *,
+    };
     use crate::bls12381::primitives::{
         group::{G1_MESSAGE, G2_MESSAGE},
         variant::{MinPk, MinSig},
     };
     use blst::BLST_ERROR;
-    use commonware_codec::{DecodeExt, Encode, Error as CodecError, ReadExt};
+    use commonware_codec::{Copying, DecodeExt, Encode, Error as CodecError, ReadExt};
     use commonware_formatting::from_hex;
     use commonware_math::algebra::{Additive, CryptoGroup};
     use commonware_parallel::Sequential;
@@ -390,6 +398,48 @@ mod tests {
     fn test_batch_verify_rejects_identity_signature() {
         batch_verify_rejects_identity_signature::<MinPk>();
         batch_verify_rejects_identity_signature::<MinSig>();
+    }
+
+    fn wycheproof_min_pk(dst: DST, vectors: &[Vector]) {
+        for vector in vectors {
+            let public = <MinPk as Variant>::Public::decode(Copying(vector.public_key));
+            let signature = <MinPk as Variant>::Signature::decode(Copying(vector.signature));
+            let valid = match (public, signature) {
+                (Ok(public), Ok(signature)) => {
+                    let valid = verify::<MinPk>(&public, dst, vector.message, &signature).is_ok();
+                    let hm = hash::<MinPk>(dst, vector.message);
+                    let batch = MinPk::batch_verify(
+                        &mut test_rng(),
+                        &[public],
+                        &[hm],
+                        &[signature],
+                        &Sequential,
+                    )
+                    .is_ok();
+                    assert_eq!(batch, valid, "Wycheproof BLS test {} batch", vector.tc_id);
+                    valid
+                }
+                _ => false,
+            };
+            assert_eq!(
+                valid,
+                vector.result == Outcome::Valid,
+                "Wycheproof BLS test {} {:?}",
+                vector.tc_id,
+                vector.flags
+            );
+        }
+    }
+
+    #[test]
+    fn test_wycheproof_g2_basic() {
+        wycheproof_min_pk(BLS_SIG_G2_BASIC_DST, BLS_SIG_G2_BASIC);
+    }
+
+    #[test]
+    fn test_wycheproof_g2_pop() {
+        assert_eq!(BLS_SIG_G2_POP_DST, MinPk::MESSAGE);
+        wycheproof_min_pk(BLS_SIG_G2_POP_DST, BLS_SIG_G2_POP);
     }
 
     fn parse_sign_vector(
