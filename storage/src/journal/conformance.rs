@@ -60,6 +60,7 @@ fn authenticated_journal_config(prefix: &str) -> fixed::Config {
         page_cache: CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
         write_buffer: WRITE_BUFFER,
         replay_buffer: REPLAY_BUFFER,
+        max_open_blobs: None,
     }
 }
 
@@ -114,6 +115,7 @@ impl StorageWorkload for ContiguousFixedWorkload {
             page_cache: CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
             write_buffer: WRITE_BUFFER,
             replay_buffer: REPLAY_BUFFER,
+            max_open_blobs: None,
         };
         let mut journal = fixed::Journal::<_, u64>::init(context.child("journal"), config).await?;
 

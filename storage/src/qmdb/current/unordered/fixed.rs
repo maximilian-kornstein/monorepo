@@ -618,6 +618,7 @@ pub mod test {
                     page_cache: CacheRef::new(page_size, NZUsize!(64)),
                     write_buffer: NZUsize!(1300),
                     replay_buffer: NZUsize!(4096),
+                    max_open_blobs: None,
                 },
                 grafted_metadata_partition: "rebranch-current-metadata".into(),
                 translator: TwoCap,

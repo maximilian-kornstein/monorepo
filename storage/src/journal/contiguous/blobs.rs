@@ -15,9 +15,21 @@ use commonware_runtime::{
     buffer::paged::{CacheRef, Recovery as PagedRecovery, Replay as PagedReplay, Sealed, Writer},
     telemetry::metrics::{Counter, Gauge, GaugeExt as _, MetricsExt as _},
 };
-use commonware_utils::futures::try_join_all;
-use futures::{FutureExt as _, future};
-use std::{collections::BTreeMap, num::NonZeroUsize, sync::Arc};
+use commonware_utils::{
+    cache::Cache,
+    futures::try_join_all,
+    sync::{AsyncMutex, Mutex, RwLock},
+};
+use futures::{
+    FutureExt as _,
+    future::{self, BoxFuture},
+};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    num::NonZeroUsize,
+    ops::Range,
+    sync::{Arc, OnceLock, Weak},
+};
 use tracing::debug;
 
 /// Metrics for a journal's blobs.
@@ -187,22 +199,293 @@ impl<E: Context> Partition<E> {
     }
 }
 
+/// Opens a sealed blob by index.
+type Opener<B> = Box<dyn Fn(u64) -> BoxFuture<'static, Result<Sealed<B>, Error>> + Send + Sync>;
+
+/// Keeps one open of a blob alive and, once the blob is sealed, its full read handle.
+///
+/// Every handle a reader can hold carries the lease of the open it reads, so a dead lease means
+/// the blob is closed and can be reopened without racing an earlier open.
+pub(super) struct Lease<B: RBlob> {
+    sealed: OnceLock<Sealed<B>>,
+}
+
+impl<B: RBlob> Lease<B> {
+    const fn new() -> Self {
+        Self {
+            sealed: OnceLock::new(),
+        }
+    }
+
+    fn sealed(&self) -> &Sealed<B> {
+        self.sealed.get().expect("history leases are sealed")
+    }
+}
+
+impl<B: RBlob> From<Sealed<B>> for Lease<B> {
+    fn from(sealed: Sealed<B>) -> Self {
+        Self {
+            sealed: OnceLock::from(sealed),
+        }
+    }
+}
+
+/// Leases a snapshot holds for blobs removed while it may still read them.
+pub(super) struct Pins<B: RBlob> {
+    /// Sealed blobs the snapshot covers.
+    range: Range<u64>,
+    leases: Mutex<BTreeMap<u64, Arc<Lease<B>>>>,
+}
+
+/// One retained sealed blob.
+struct Slot<B: RBlob> {
+    /// Logical size at sealing, checked on every reopen.
+    size: u64,
+    /// Lease of the blob's current open, dead while the blob is closed.
+    lease: Weak<Lease<B>>,
+}
+
+/// Mutable state of [Bounded].
+struct State<B: RBlob> {
+    /// Index of the first entry in `slots`.
+    oldest: u64,
+    /// Retained sealed blobs, oldest first.
+    slots: VecDeque<Slot<B>>,
+    /// Leases the journal keeps open. The cache keeps removed values in free slots, so a value is
+    /// emptied before its key is removed.
+    retained: Cache<u64, Option<Arc<Lease<B>>>>,
+    /// Pins of every snapshot that may still be alive.
+    snapshots: Vec<Weak<Pins<B>>>,
+}
+
+impl<B: RBlob> State<B> {
+    fn slot(&self, blob: u64) -> Option<&Slot<B>> {
+        let index = usize::try_from(blob.checked_sub(self.oldest)?).ok()?;
+        self.slots.get(index)
+    }
+
+    fn slot_mut(&mut self, blob: u64) -> Option<&mut Slot<B>> {
+        let index = usize::try_from(blob.checked_sub(self.oldest)?).ok()?;
+        self.slots.get_mut(index)
+    }
+
+    /// Keep `lease` open, returning any lease displaced from the cache.
+    fn retain(&mut self, blob: u64, lease: Arc<Lease<B>>) -> Option<Arc<Lease<B>>> {
+        self.retained.put(blob, Some(lease)).flatten()
+    }
+
+    /// Stop keeping `blob` open, returning its lease.
+    fn release(&mut self, blob: u64) -> Option<Arc<Lease<B>>> {
+        let lease = self.retained.get_mut(&blob).and_then(Option::take);
+        self.retained.remove(&blob);
+        lease
+    }
+}
+
+/// Sealed blobs opened on demand, of which at most a fixed number are kept open.
+///
+/// Readers resolve sealed blobs through [Self::get]. A blob whose lease is alive is shared rather
+/// than reopened. Before the journal removes a blob, it pins an open lease for every snapshot that
+/// covers the blob, so a snapshot never reopens a removed blob.
+pub(super) struct Bounded<B: RBlob> {
+    open: Opener<B>,
+    state: RwLock<State<B>>,
+    /// Serializes opens and removals.
+    opening: AsyncMutex<()>,
+}
+
+impl<B: RBlob> Bounded<B> {
+    fn new(open: Opener<B>, capacity: NonZeroUsize, oldest: u64) -> Self {
+        Self {
+            open,
+            state: RwLock::new(State {
+                oldest,
+                slots: VecDeque::new(),
+                retained: Cache::new(capacity),
+                snapshots: Vec::new(),
+            }),
+            opening: AsyncMutex::new(()),
+        }
+    }
+
+    /// Return a live lease for `blob` without opening it.
+    fn lookup(&self, blob: u64, pins: Option<&Pins<B>>) -> Option<Arc<Lease<B>>> {
+        let lease = {
+            let state = self.state.read();
+            if blob < state.oldest {
+                return pins?.leases.lock().get(&blob).cloned();
+            }
+            let lease = state.slot(blob)?.lease.upgrade()?;
+            if state.retained.get(&blob).is_some() {
+                return Some(lease);
+            }
+            lease
+        };
+
+        // A reader still holds this open. Keep it rather than reopen the blob once that reader
+        // releases it.
+        let mut state = self.state.write();
+        let displaced = (blob >= state.oldest)
+            .then(|| state.retain(blob, lease.clone()))
+            .flatten();
+        drop(state);
+        drop(displaced);
+        Some(lease)
+    }
+
+    /// Return a lease for sealed `blob`, opening the blob if it is closed. Returns `None` if the
+    /// blob is not retained and no pin covers it.
+    async fn get(&self, blob: u64, pins: Option<&Pins<B>>) -> Result<Option<Arc<Lease<B>>>, Error> {
+        if let Some(lease) = self.lookup(blob, pins) {
+            return Ok(Some(lease));
+        }
+        let _opening = self.opening.lock().await;
+        if let Some(lease) = self.lookup(blob, pins) {
+            return Ok(Some(lease));
+        }
+        let Some(lease) = self.reopen(blob).await? else {
+            return Ok(None);
+        };
+        let displaced = self.state.write().retain(blob, lease.clone());
+        drop(displaced);
+        Ok(Some(lease))
+    }
+
+    /// Open closed `blob` if it is retained. The caller holds [Self::opening].
+    async fn reopen(&self, blob: u64) -> Result<Option<Arc<Lease<B>>>, Error> {
+        let Some(size) = self.state.read().slot(blob).map(|slot| slot.size) else {
+            return Ok(None);
+        };
+        let sealed = (self.open)(blob).await?;
+        if sealed.size() != size {
+            return Err(Error::Corruption(format!(
+                "blob {blob} reopened with size {} (sealed with {size})",
+                sealed.size()
+            )));
+        }
+        let lease = Arc::new(Lease::from(sealed));
+        if let Some(slot) = self.state.write().slot_mut(blob) {
+            slot.lease = Arc::downgrade(&lease);
+        }
+        Ok(Some(lease))
+    }
+
+    /// Track a newly sealed blob and keep it open.
+    fn push(&self, lease: Arc<Lease<B>>) {
+        let mut state = self.state.write();
+        let blob = state.oldest + state.slots.len() as u64;
+        state.slots.push_back(Slot {
+            size: lease.sealed().size(),
+            lease: Arc::downgrade(&lease),
+        });
+        let displaced = state.retain(blob, lease);
+        drop(state);
+        drop(displaced);
+    }
+
+    /// Register a snapshot covering the sealed blobs in `range`.
+    fn register(&self, range: Range<u64>) -> Arc<Pins<B>> {
+        let pins = Arc::new(Pins {
+            range,
+            leases: Mutex::new(BTreeMap::new()),
+        });
+        let mut state = self.state.write();
+        state.snapshots.retain(|pins| pins.strong_count() > 0);
+        state.snapshots.push(Arc::downgrade(&pins));
+        pins
+    }
+
+    /// Remove the oldest retained blob with `remove`, first pinning it for every live snapshot
+    /// that covers it.
+    async fn remove_oldest<F, Fut>(&self, remove: F) -> Result<(), Error>
+    where
+        F: FnOnce(u64) -> Fut,
+        Fut: Future<Output = Result<(), Error>>,
+    {
+        let _opening = self.opening.lock().await;
+        let (blob, covering) = {
+            let mut state = self.state.write();
+            state.snapshots.retain(|pins| pins.strong_count() > 0);
+            let blob = state.oldest;
+            let covering: Vec<_> = state
+                .snapshots
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|pins| pins.range.contains(&blob))
+                .collect();
+            (blob, covering)
+        };
+        if !covering.is_empty() {
+            let lease = match self.lookup(blob, None) {
+                Some(lease) => lease,
+                None => self
+                    .reopen(blob)
+                    .await?
+                    .expect("the oldest retained blob has a slot"),
+            };
+            for pins in covering {
+                pins.leases.lock().insert(blob, lease.clone());
+            }
+        }
+        remove(blob).await?;
+
+        let mut state = self.state.write();
+        let released = state.release(blob);
+        state.slots.pop_front();
+        state.oldest += 1;
+        drop(state);
+        drop(released);
+        Ok(())
+    }
+
+    /// Restart an empty history at `oldest`.
+    fn reset(&self, oldest: u64) {
+        let mut state = self.state.write();
+        assert!(state.slots.is_empty());
+        state.oldest = oldest;
+    }
+}
+
+/// Sealed historical blobs of a [Writable].
+enum History<B: RBlob> {
+    /// Every sealed blob is held open.
+    Open {
+        sealed: Vec<Sealed<B>>,
+        /// Cached owned snapshot of `sealed`.
+        snapshot: Option<Arc<[Sealed<B>]>>,
+    },
+    /// Sealed blobs are opened on demand.
+    Bounded {
+        blobs: Arc<Bounded<B>>,
+        /// Number of sealed blobs.
+        len: u64,
+        /// Lease of the tail's open, sealed into history when the tail is.
+        tail: Arc<Lease<B>>,
+    },
+}
+
+impl<B: RBlob> History<B> {
+    const fn len(&self) -> u64 {
+        match self {
+            Self::Open { sealed, .. } => sealed.len() as u64,
+            Self::Bounded { len, .. } => *len,
+        }
+    }
+}
+
 /// A journal's blobs: contiguous sealed blobs ending in one writable tail.
 pub(super) struct Writable<E: Context> {
-    partition: Partition<E>,
+    partition: Arc<Partition<E>>,
     metrics: Metrics,
 
     /// The writable tail.
     tail: Writer<E::Blob>,
 
-    /// Index of the first blob in [Self::sealed].
+    /// Index of the first sealed blob.
     oldest_blob_index: u64,
 
     /// Sealed historical blobs.
-    sealed: Vec<Sealed<E::Blob>>,
-
-    /// Cached owned snapshot of [Self::sealed].
-    sealed_snapshot: Option<Arc<[Sealed<E::Blob>]>>,
+    history: History<E::Blob>,
 
     /// Sync of the tail's predecessor.
     tail_predecessor_sync: Option<SyncCompletion>,
@@ -210,7 +493,8 @@ pub(super) struct Writable<E: Context> {
 
 impl<E: Context> Writable<E> {
     /// Build from recovered writers: seal every blob below `tail_blob` and install the tail,
-    /// opening an empty one if absent.
+    /// opening an empty one if absent. With `max_open`, only the newest `max_open` sealed blobs
+    /// stay open.
     ///
     /// # Invariants
     ///
@@ -221,6 +505,7 @@ impl<E: Context> Writable<E> {
         partition: Partition<E>,
         pending: BTreeMap<u64, PagedRecovery<E::Blob>>,
         tail_blob: u64,
+        max_open: Option<NonZeroUsize>,
     ) -> Result<Self, Error> {
         if let Some(&newest) = pending.keys().next_back()
             && newest > tail_blob
@@ -267,14 +552,55 @@ impl<E: Context> Writable<E> {
 
         let metrics = Metrics::new(&partition.context);
         let _ = metrics.tracked.try_set(sealed.len() + 1);
+        let partition = Arc::new(partition);
+        let history = match max_open {
+            None => History::Open {
+                sealed,
+                snapshot: None,
+            },
+            Some(capacity) => {
+                let len = sealed.len() as u64;
+                let blobs = Bounded::new(Self::opener(&partition), capacity, oldest_blob_index);
+
+                // Every sealed blob is durable, so all but the newest close here.
+                let open_from = sealed.len().saturating_sub(capacity.get());
+                for (index, sealed) in sealed.into_iter().enumerate() {
+                    if index < open_from {
+                        blobs.state.write().slots.push_back(Slot {
+                            size: sealed.size(),
+                            lease: Weak::new(),
+                        });
+                    } else {
+                        blobs.push(Arc::new(Lease::from(sealed)));
+                    }
+                }
+                History::Bounded {
+                    blobs: Arc::new(blobs),
+                    len,
+                    tail: Arc::new(Lease::new()),
+                }
+            }
+        };
         Ok(Self {
             partition,
             metrics,
             oldest_blob_index,
             tail,
-            sealed,
-            sealed_snapshot: None,
+            history,
             tail_predecessor_sync: None,
+        })
+    }
+
+    /// Open sealed blobs of `partition` for a [Bounded] history.
+    fn opener(partition: &Arc<Partition<E>>) -> Opener<E::Blob> {
+        let partition = partition.clone();
+        Box::new(move |blob| {
+            let partition = partition.clone();
+            async move {
+                let (_, sealed) = partition.open(blob).await?.snapshot().await?;
+                Ok(sealed)
+            }
+            .boxed()
         })
     }
 
@@ -285,7 +611,7 @@ impl<E: Context> Writable<E> {
 
     /// Index of the newest blob.
     pub(super) const fn tail_blob_index(&self) -> u64 {
-        self.oldest_blob_index + self.sealed.len() as u64
+        self.oldest_blob_index + self.history.len()
     }
 
     /// Encode a value directly into the tail's write buffer if it fits, returning its logical
@@ -309,22 +635,40 @@ impl<E: Context> Writable<E> {
 
     /// Borrow the current blobs for a live reader.
     pub(super) fn reader(&self) -> Blobs<'_, E::Blob> {
+        let sealed = match &self.history {
+            History::Open { sealed, .. } => SealedBlobs::Borrowed(sealed),
+            History::Bounded { blobs, .. } => SealedBlobs::Bounded {
+                blobs: blobs.clone(),
+                end: self.tail_blob_index(),
+                pins: None,
+            },
+        };
         Blobs {
             oldest_blob_index: self.oldest_blob_index,
-            sealed: SealedBlobs::Borrowed(&self.sealed),
+            sealed,
             tail: Blob::Writer(&self.tail),
         }
     }
 
     /// Capture owned blob handles for a snapshot reader.
     pub(super) async fn snapshot(mut self) -> Result<(Self, Blobs<'static, E::Blob>), Error> {
-        // Reuse the immutable history shared by snapshots until its membership changes.
-        let sealed = match &self.sealed_snapshot {
-            Some(sealed) => sealed.clone(),
-            None => {
-                let sealed: Arc<[Sealed<E::Blob>]> = self.sealed.clone().into();
-                self.sealed_snapshot = Some(sealed.clone());
-                sealed
+        let range = self.oldest_blob_index..self.tail_blob_index();
+        let (sealed, lease) = match &mut self.history {
+            // Reuse the immutable history shared by snapshots until its membership changes.
+            History::Open { sealed, snapshot } => {
+                let sealed = snapshot
+                    .get_or_insert_with(|| sealed.clone().into())
+                    .clone();
+                (SealedBlobs::Owned(sealed), None)
+            }
+            History::Bounded { blobs, tail, .. } => {
+                let pins = blobs.register(range.clone());
+                let sealed = SealedBlobs::Bounded {
+                    blobs: blobs.clone(),
+                    end: range.end,
+                    pins: Some(pins),
+                };
+                (sealed, Some(tail.clone()))
             }
         };
 
@@ -332,9 +676,9 @@ impl<E: Context> Writable<E> {
         let (tail, snapshot) = self.tail.snapshot().await?;
         self.tail = tail;
         let blobs = Blobs {
-            oldest_blob_index: self.oldest_blob_index,
-            sealed: SealedBlobs::Owned(sealed),
-            tail: Blob::Sealed(snapshot),
+            oldest_blob_index: range.start,
+            sealed,
+            tail: Blob::Sealed(snapshot, lease),
         };
         Ok((self, blobs))
     }
@@ -355,8 +699,21 @@ impl<E: Context> Writable<E> {
         let (sealed, handle) = old_writer.seal().await?;
         self.metrics.tracked.inc();
         self.metrics.synced.inc();
-        self.sealed.push(sealed);
-        self.sealed_snapshot = None;
+        match &mut self.history {
+            History::Open {
+                sealed: history,
+                snapshot,
+            } => {
+                history.push(sealed);
+                *snapshot = None;
+            }
+            History::Bounded { blobs, len, tail } => {
+                let lease = std::mem::replace(tail, Arc::new(Lease::new()));
+                assert!(lease.sealed.set(sealed).is_ok(), "tail lease sealed twice");
+                blobs.push(lease);
+                *len += 1;
+            }
+        }
         assert!(self.tail_predecessor_sync.is_none());
         self.tail_predecessor_sync = Some(handle.boxed().shared());
         Ok(self)
@@ -378,6 +735,33 @@ impl<E: Context> Writable<E> {
         Some((blob, blob * items_per_blob))
     }
 
+    /// Drop every sealed blob below `min_blob` and remove its file, oldest-first. Snapshot readers
+    /// keep handles to removed blobs, which the runtime's read-after-remove contract keeps valid.
+    async fn remove_sealed(&mut self, min_blob: u64) -> Result<(), Error> {
+        let drop_count = (min_blob - self.oldest_blob_index) as usize;
+        let prev_oldest_blob_index = self.oldest_blob_index;
+        match &mut self.history {
+            History::Open { sealed, snapshot } => {
+                sealed.drain(..drop_count);
+                *snapshot = None;
+                self.oldest_blob_index = min_blob;
+                for blob in prev_oldest_blob_index..min_blob {
+                    self.partition.remove(blob).await?;
+                }
+            }
+            History::Bounded { blobs, len, .. } => {
+                for _ in prev_oldest_blob_index..min_blob {
+                    blobs
+                        .remove_oldest(|blob| self.partition.remove(blob))
+                        .await?;
+                    self.oldest_blob_index += 1;
+                    *len -= 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Drop every blob below `min_blob` and remove its file, oldest-first. Safe with live readers:
     /// snapshot readers keep their own handles, which the runtime's read-after-remove contract keeps
     /// valid.
@@ -392,14 +776,9 @@ impl<E: Context> Writable<E> {
         self.drain_tail_predecessor_sync().await?;
         self.tail = self.tail.wait_for_sync().await?;
 
-        let drop_count = (min_blob - self.oldest_blob_index) as usize;
-        let prev_oldest_blob_index = self.oldest_blob_index;
-        self.sealed.drain(..drop_count);
-        self.sealed_snapshot = None;
-        self.oldest_blob_index = min_blob;
-
-        for blob in prev_oldest_blob_index..min_blob {
-            self.partition.remove(blob).await?;
+        let pruned = min_blob - self.oldest_blob_index;
+        self.remove_sealed(min_blob).await?;
+        for _ in 0..pruned {
             self.metrics.tracked.dec();
             self.metrics.pruned.inc();
         }
@@ -415,15 +794,17 @@ impl<E: Context> Writable<E> {
         self.drain_tail_predecessor_sync().await?;
         self.tail = self.tail.wait_for_sync().await?;
 
-        for blob in self.oldest_blob_index..=self.tail_blob_index() {
-            self.partition.remove(blob).await?;
-        }
+        let old_tail = self.tail_blob_index();
+        self.remove_sealed(old_tail).await?;
+        self.partition.remove(old_tail).await?;
         let _ = self.metrics.tracked.try_set(0);
         self.tail = self.partition.open(tail_blob).await?;
         self.metrics.tracked.inc();
         self.oldest_blob_index = tail_blob;
-        self.sealed.clear();
-        self.sealed_snapshot = None;
+        if let History::Bounded { blobs, tail, .. } = &mut self.history {
+            blobs.reset(tail_blob);
+            *tail = Arc::new(Lease::new());
+        }
         Ok(self)
     }
 
@@ -469,12 +850,11 @@ impl<E: Context> Writable<E> {
     /// Remove every blob and the partition itself, after observing any started sync so a failed
     /// sync removes nothing.
     pub(super) async fn destroy(self) -> Result<(), Error> {
-        let blobs = self.wait_for_sync().await?;
+        let mut blobs = self.wait_for_sync().await?;
         let tail_blob = blobs.tail_blob_index();
+        blobs.remove_sealed(tail_blob).await?;
         drop(blobs.tail);
-        for blob in blobs.oldest_blob_index..=tail_blob {
-            blobs.partition.remove(blob).await?;
-        }
+        blobs.partition.remove(tail_blob).await?;
         Partition::remove_all(&blobs.partition.context, &blobs.partition.name).await
     }
 }
@@ -491,19 +871,40 @@ pub(super) struct Blobs<'a, B: RBlob> {
     tail: Blob<'a, B>,
 }
 
-/// Storage for the sealed history slice.
+impl<B: RBlob> Clone for Blobs<'_, B> {
+    fn clone(&self) -> Self {
+        Self {
+            oldest_blob_index: self.oldest_blob_index,
+            sealed: self.sealed.clone(),
+            tail: self.tail.clone(),
+        }
+    }
+}
+
+/// Storage for the sealed history.
 enum SealedBlobs<'a, B: RBlob> {
     /// Borrowed sealed slice.
     Borrowed(&'a [Sealed<B>]),
     /// Owned sealed slice.
     Owned(Arc<[Sealed<B>]>),
+    /// Sealed blobs below `end` opened on demand. A snapshot's `pins` hold blobs removed since.
+    Bounded {
+        blobs: Arc<Bounded<B>>,
+        end: u64,
+        pins: Option<Arc<Pins<B>>>,
+    },
 }
 
-impl<B: RBlob> SealedBlobs<'_, B> {
-    fn as_slice(&self) -> &[Sealed<B>] {
+impl<B: RBlob> Clone for SealedBlobs<'_, B> {
+    fn clone(&self) -> Self {
         match self {
-            Self::Borrowed(sealed) => sealed,
-            Self::Owned(sealed) => sealed,
+            Self::Borrowed(sealed) => Self::Borrowed(sealed),
+            Self::Owned(sealed) => Self::Owned(sealed.clone()),
+            Self::Bounded { blobs, end, pins } => Self::Bounded {
+                blobs: blobs.clone(),
+                end: *end,
+                pins: pins.clone(),
+            },
         }
     }
 }
@@ -513,16 +914,22 @@ pub(super) enum Blob<'a, B: RBlob> {
     /// Writable tail. Point reads go through the writer's cache-aware logical view, and
     /// [`Self::replay_from`] chooses the replay path.
     Writer(&'a Writer<B>),
-    /// Immutable historical blob.
-    Sealed(Sealed<B>),
+    /// Immutable view, with the lease of its open when the journal may reopen the blob.
+    Sealed(Sealed<B>, Option<Arc<Lease<B>>>),
 }
 
 impl<B: RBlob> Clone for Blob<'_, B> {
     fn clone(&self) -> Self {
         match self {
             Self::Writer(writer) => Self::Writer(writer),
-            Self::Sealed(sealed) => Self::Sealed(sealed.clone()),
+            Self::Sealed(sealed, lease) => Self::Sealed(sealed.clone(), lease.clone()),
         }
+    }
+}
+
+impl<B: RBlob> From<Arc<Lease<B>>> for Blob<'_, B> {
+    fn from(lease: Arc<Lease<B>>) -> Self {
+        Self::Sealed(lease.sealed().clone(), Some(lease))
     }
 }
 
@@ -531,7 +938,7 @@ impl<'a, B: RBlob> Blob<'a, B> {
     pub(super) fn size(&self) -> u64 {
         match self {
             Self::Writer(writer) => writer.size(),
-            Self::Sealed(sealed) => sealed.size(),
+            Self::Sealed(sealed, _) => sealed.size(),
         }
     }
 
@@ -539,7 +946,7 @@ impl<'a, B: RBlob> Blob<'a, B> {
     pub(super) fn try_read_sync_into(&self, buf: &mut [u8], offset: u64) -> bool {
         match self {
             Self::Writer(writer) => writer.try_read_sync_into(buf, offset),
-            Self::Sealed(sealed) => sealed.try_read_sync_into(buf, offset),
+            Self::Sealed(sealed, _) => sealed.try_read_sync_into(buf, offset),
         }
     }
 
@@ -547,7 +954,7 @@ impl<'a, B: RBlob> Blob<'a, B> {
     pub(super) async fn read_at(&self, offset: u64, len: usize) -> Result<IoBufs, Error> {
         match self {
             Self::Writer(writer) => Ok(writer.read_at(offset, len).await?),
-            Self::Sealed(sealed) => Ok(sealed.read_at(offset, len).await?),
+            Self::Sealed(sealed, _) => Ok(sealed.read_at(offset, len).await?),
         }
     }
 
@@ -560,7 +967,7 @@ impl<'a, B: RBlob> Blob<'a, B> {
     ) -> Result<(IoBufMut, usize), Error> {
         match self {
             Self::Writer(writer) => Ok(writer.read_up_to(offset, len, bufs).await?),
-            Self::Sealed(sealed) => Ok(sealed.read_up_to(offset, len, bufs).await?),
+            Self::Sealed(sealed, _) => Ok(sealed.read_up_to(offset, len, bufs).await?),
         }
     }
 
@@ -579,16 +986,16 @@ impl<'a, B: RBlob> Blob<'a, B> {
         buffer_size: NonZeroUsize,
         read_options: ReadOptions,
     ) -> Result<Replay<'a, B>, Error> {
-        let sealed = match self {
+        let (sealed, lease) = match self {
             Self::Writer(writer) => match writer.try_snapshot() {
-                Some(snapshot) => snapshot,
+                Some(snapshot) => (snapshot, None),
                 None => return Replay::view(Self::Writer(writer), offset, buffer_size),
             },
-            Self::Sealed(sealed) => sealed,
+            Self::Sealed(sealed, lease) => (sealed, lease),
         };
         let mut replay = sealed.replay(buffer_size, read_options)?;
         replay.seek_to(offset)?;
-        Ok(Replay::paged(replay))
+        Ok(Replay::paged(replay, lease))
     }
 
     /// Read fixed-size items at sorted byte offsets into `buf`.
@@ -600,7 +1007,7 @@ impl<'a, B: RBlob> Blob<'a, B> {
     ) -> Result<usize, Error> {
         match self {
             Self::Writer(writer) => Ok(writer.read_many_into(buf, offsets, item_size).await?),
-            Self::Sealed(sealed) => Ok(sealed.read_many_into(buf, offsets, item_size).await?),
+            Self::Sealed(sealed, _) => Ok(sealed.read_many_into(buf, offsets, item_size).await?),
         }
     }
 
@@ -612,7 +1019,7 @@ impl<'a, B: RBlob> Blob<'a, B> {
     ) -> Result<usize, Error> {
         match self {
             Self::Writer(writer) => Ok(writer.read_ranges_into(buf, ranges).await?),
-            Self::Sealed(sealed) => Ok(sealed.read_ranges_into(buf, ranges).await?),
+            Self::Sealed(sealed, _) => Ok(sealed.read_ranges_into(buf, ranges).await?),
         }
     }
 
@@ -626,7 +1033,7 @@ impl<'a, B: RBlob> Blob<'a, B> {
     ) -> Vec<usize> {
         match self {
             Self::Writer(writer) => writer.try_read_many_sync_into(buf, offsets, item_size),
-            Self::Sealed(sealed) => sealed.try_read_many_sync_into(buf, offsets, item_size),
+            Self::Sealed(sealed, _) => sealed.try_read_many_sync_into(buf, offsets, item_size),
         }
     }
 
@@ -638,7 +1045,7 @@ impl<'a, B: RBlob> Blob<'a, B> {
     ) -> Vec<usize> {
         match self {
             Self::Writer(writer) => writer.try_read_ranges_sync_into(buf, ranges),
-            Self::Sealed(sealed) => sealed.try_read_ranges_sync_into(buf, ranges),
+            Self::Sealed(sealed, _) => sealed.try_read_ranges_sync_into(buf, ranges),
         }
     }
 }
@@ -667,6 +1074,8 @@ impl<B: RBlob> FrameReader for Blob<'_, B> {
 /// buffers implement [`Buf`], keeping codec readers behind this dispatch.
 pub(super) struct Replay<'a, B: RBlob> {
     inner: ReplayInner<'a, B>,
+    /// Keeps a paged replay's open alive, since the runtime replay holds the blob directly.
+    _lease: Option<Arc<Lease<B>>>,
 }
 
 /// Backing strategy for sequential blob replay.
@@ -711,9 +1120,10 @@ impl<'a, B: RBlob> Replay<'a, B> {
     }
 
     /// Wrap a paged replay handle.
-    const fn paged(replay: PagedReplay<B>) -> Self {
+    const fn paged(replay: PagedReplay<B>, lease: Option<Arc<Lease<B>>>) -> Self {
         Self {
             inner: ReplayInner::Paged(replay),
+            _lease: lease,
         }
     }
 
@@ -721,6 +1131,7 @@ impl<'a, B: RBlob> Replay<'a, B> {
     fn view(blob: Blob<'a, B>, offset: u64, buffer_size: NonZeroUsize) -> Result<Self, Error> {
         Ok(Self {
             inner: ReplayInner::View(ViewReplay::new(blob, offset, buffer_size)?),
+            _lease: None,
         })
     }
 
@@ -871,19 +1282,54 @@ impl<B: RBlob> bytes::Buf for ViewReplay<'_, B> {
 impl<'a, B: RBlob> Blobs<'a, B> {
     /// Index of the newest blob (the tail).
     pub(super) fn tail_blob_index(&self) -> u64 {
-        self.oldest_blob_index + self.sealed.as_slice().len() as u64
+        match &self.sealed {
+            SealedBlobs::Borrowed(sealed) => self.oldest_blob_index + sealed.len() as u64,
+            SealedBlobs::Owned(sealed) => self.oldest_blob_index + sealed.len() as u64,
+            SealedBlobs::Bounded { end, .. } => *end,
+        }
     }
 
-    /// Resolve a blob, if retained.
+    /// Resolve a blob if retained and open, without I/O.
     pub(super) fn get(&self, blob: u64) -> Option<Blob<'a, B>> {
         if blob == self.tail_blob_index() {
             return Some(self.tail.clone());
         }
-        self.sealed
-            .as_slice()
-            .get(blob.checked_sub(self.oldest_blob_index)? as usize)
-            .cloned()
-            .map(Blob::Sealed)
+        let index = blob.checked_sub(self.oldest_blob_index)?;
+        match &self.sealed {
+            SealedBlobs::Borrowed(sealed) => Self::sealed_at(sealed, index),
+            SealedBlobs::Owned(sealed) => Self::sealed_at(sealed, index),
+            SealedBlobs::Bounded { blobs, end, pins } => (blob < *end)
+                .then(|| blobs.lookup(blob, pins.as_deref()))
+                .flatten()
+                .map(Blob::from),
+        }
+    }
+
+    /// Resolve a blob if this view holds it open for its whole lifetime.
+    pub(super) fn get_held(&self, blob: u64) -> Option<Blob<'a, B>> {
+        match &self.sealed {
+            SealedBlobs::Bounded { end, .. } => (blob == *end).then(|| self.tail.clone()),
+            _ => self.get(blob),
+        }
+    }
+
+    /// Resolve a blob if retained, opening it if needed.
+    pub(super) async fn resolve(&self, blob: u64) -> Result<Option<Blob<'a, B>>, Error> {
+        let SealedBlobs::Bounded { blobs, end, pins } = &self.sealed else {
+            return Ok(self.get(blob));
+        };
+        if blob == *end {
+            return Ok(Some(self.tail.clone()));
+        }
+        if blob < self.oldest_blob_index || blob > *end {
+            return Ok(None);
+        }
+        Ok(blobs.get(blob, pins.as_deref()).await?.map(Blob::from))
+    }
+
+    fn sealed_at(sealed: &[Sealed<B>], index: u64) -> Option<Blob<'a, B>> {
+        let sealed = sealed.get(usize::try_from(index).ok()?)?;
+        Some(Blob::Sealed(sealed.clone(), None))
     }
 }
 
@@ -961,7 +1407,7 @@ mod tests {
             let writer = Writer::new(blob, size, 128, cache).await.unwrap();
             let (writer, _) = writer.append(&encoded).await.unwrap();
             let (_, snapshot) = writer.snapshot().await.unwrap();
-            let source = Blob::Sealed(snapshot);
+            let source = Blob::Sealed(snapshot, None);
             let mut replay = source
                 .replay_from(0, NZUsize!(128), ReadOptions::default())
                 .unwrap();
@@ -1010,7 +1456,7 @@ mod tests {
             for (source, offset, paged) in [
                 (Blob::Writer(&pending), 40, false),
                 (Blob::Writer(&writer), 0, true),
-                (Blob::Sealed(snapshot), 0, true),
+                (Blob::Sealed(snapshot, None), 0, true),
             ] {
                 let mut replay = source
                     .replay_from(offset, NZUsize!(12), ReadOptions::default())
@@ -1109,7 +1555,7 @@ mod tests {
                 for (source, offset) in [
                     (Blob::Writer(&pending), 64),
                     (Blob::Writer(&writer), 0),
-                    (Blob::Sealed(snapshot), 0),
+                    (Blob::Sealed(snapshot, None), 0),
                 ] {
                     let mut replay = source
                         .clone()
@@ -1195,7 +1641,7 @@ mod tests {
             );
 
             let (writer, snapshot) = writer.snapshot().await.unwrap();
-            let snapshot_blob = Blob::Sealed(snapshot);
+            let snapshot_blob = Blob::Sealed(snapshot, None);
             assert_insufficient_length(
                 snapshot_blob
                     .read_up_to(size, 1, IoBufMut::with_capacity(1))
@@ -1212,7 +1658,7 @@ mod tests {
 
             let (sealed, sync) = writer.seal().await.unwrap();
             sync.await.unwrap();
-            let sealed_blob = Blob::Sealed(sealed);
+            let sealed_blob = Blob::Sealed(sealed, None);
             assert_insufficient_length(
                 sealed_blob
                     .read_up_to(size, 1, IoBufMut::with_capacity(1))

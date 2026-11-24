@@ -435,6 +435,7 @@ impl<C> Config<C> {
             page_cache: self.page_cache.clone(),
             write_buffer: self.write_buffer,
             replay_buffer: self.replay_buffer,
+            max_open_blobs: None,
         }
     }
 }
@@ -1563,7 +1564,7 @@ impl<E: Context, V: CodecShared> Recovery<E, V> {
             ));
         }
         let tail = position_to_blob(bounds.end, per_blob);
-        let blobs = Writable::recover(self.partition, self.pending, tail).await?;
+        let blobs = Writable::recover(self.partition, self.pending, tail, None).await?;
         let barrier = Barrier::new(offsets.recovery_watermark());
 
         // Publish the offsets watermark only after the data it authorizes is durable.
@@ -5363,6 +5364,7 @@ mod tests {
                         page_cache: CacheRef::new(SMALL_PAGE_SIZE, NZUsize!(16)),
                         write_buffer: NZUsize!(1024),
                         replay_buffer: NZUsize!(1024),
+                        max_open_blobs: None,
                     };
                     let mut offsets_journal = fixed::Journal::<_, u64>::init(context, offsets_cfg)
                         .await
@@ -5483,6 +5485,7 @@ mod tests {
                     page_cache: offsets_cache.clone(),
                     write_buffer: NZUsize!(1024),
                     replay_buffer: NZUsize!(1024),
+                    max_open_blobs: None,
                 },
             )
             .await
@@ -9139,6 +9142,7 @@ mod tests {
                     page_cache: cfg.page_cache.clone(),
                     write_buffer: cfg.write_buffer,
                     replay_buffer: cfg.replay_buffer,
+                    max_open_blobs: None,
                 };
                 // Simulate a crash mid-`init_at_size`: stage a clear intent in the offsets
                 // checkpoint but leave data untouched (clear_data=false) or also clear data
@@ -9218,6 +9222,7 @@ mod tests {
                 page_cache: cfg.page_cache.clone(),
                 write_buffer: cfg.write_buffer,
                 replay_buffer: cfg.replay_buffer,
+                max_open_blobs: None,
             };
             let stale_ctx = context.child("stale");
             fixed::Journal::<_, u64>::test_stage_clear(

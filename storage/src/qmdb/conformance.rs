@@ -140,6 +140,7 @@ fn fixed_log_config(suffix: &str, page_cache: CacheRef) -> FConfig {
         page_cache,
         write_buffer: NZUsize!(1024),
         replay_buffer: NZUsize!(1024),
+        max_open_blobs: None,
     }
 }
 

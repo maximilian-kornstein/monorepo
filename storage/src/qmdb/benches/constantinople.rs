@@ -446,6 +446,7 @@ fn main() {
             page_cache: pc,
             write_buffer: WRITE_BUFFER,
             replay_buffer: REPLAY_BUFFER,
+            max_open_blobs: None,
         };
         match db_kind.as_str() {
             "current::unordered::fixed::mmb" => {

@@ -1625,6 +1625,7 @@ fn test_fixed_start_sync_durability() {
             page_cache: CacheRef::new(NZU16!(44), NZUsize!(8)),
             write_buffer: NZUsize!(2048),
             replay_buffer: NZUsize!(2048),
+            max_open_blobs: None,
         };
         test_start_sync_durability(|label| {
             let cfg = cfg.clone();
@@ -1875,6 +1876,7 @@ fn fixed_overlap_cfg(partition: &str) -> fixed::Config {
         page_cache: CacheRef::new(NZU16!(44), NZUsize!(8)),
         write_buffer: NZUsize!(2048),
         replay_buffer: NZUsize!(2048),
+        max_open_blobs: None,
     }
 }
 
@@ -1901,6 +1903,7 @@ fn test_fixed_start_sync_overlaps_predecessor_and_tail() {
             page_cache: CacheRef::new(NZU16!(44), NZUsize!(8)),
             write_buffer: NZUsize!(2048),
             replay_buffer: NZUsize!(2048),
+            max_open_blobs: None,
         };
         test_start_sync_overlaps_predecessor_and_tail(context, pending, move |ctx| {
             fixed::Journal::<_, u64>::init(ctx, cfg)
@@ -2089,6 +2092,7 @@ fn test_fixed_prune_waits_for_pending_sync() {
             page_cache: CacheRef::new(NZU16!(44), NZUsize!(8)),
             write_buffer: NZUsize!(2048),
             replay_buffer: NZUsize!(2048),
+            max_open_blobs: None,
         };
         test_prune_waits_for_pending_sync(context, pending, move |ctx| {
             fixed::Journal::<_, u64>::init(ctx, cfg)
@@ -2129,6 +2133,7 @@ fn test_fixed_prune_surfaces_failed_sync() {
             page_cache: CacheRef::new(NZU16!(44), NZUsize!(8)),
             write_buffer: NZUsize!(2048),
             replay_buffer: NZUsize!(2048),
+            max_open_blobs: None,
         };
         test_prune_surfaces_failed_sync(context, pending, move |ctx| {
             fixed::Journal::<_, u64>::init(ctx, cfg)
@@ -2168,6 +2173,7 @@ fn test_fresh_sync_avoids_reset_writes() {
             write_buffer: NZUsize!(1024),
             replay_buffer: NZUsize!(1024),
             page_cache: cache.clone(),
+            max_open_blobs: None,
         };
         let (ordinary, ordinary_io) = RecordingContext::new(context.child("fixed_ordinary"));
         drop(

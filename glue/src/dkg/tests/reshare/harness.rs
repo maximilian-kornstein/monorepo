@@ -1286,6 +1286,7 @@ impl EngineDefinition for ReshareEngine {
                 page_cache: page_cache.clone(),
                 write_buffer: IO_BUFFER_SIZE,
                 replay_buffer: IO_BUFFER_SIZE,
+                max_open_blobs: None,
             },
             translator: TwoCap,
             init_cache: Some(NZUsize!(1024)),

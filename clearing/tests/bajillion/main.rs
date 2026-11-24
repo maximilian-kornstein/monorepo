@@ -267,6 +267,7 @@ fn config_for<O: commonware_cryptography::PublicKey>(
         page_cache: page_cache.clone(),
         write_buffer: NZUsize!(1024),
         replay_buffer: NZUsize!(1024),
+        max_open_blobs: None,
     };
     let payouts = format!("{name}-payouts");
     Config {

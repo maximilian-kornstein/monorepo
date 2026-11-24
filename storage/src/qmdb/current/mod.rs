@@ -885,6 +885,7 @@ pub mod tests {
                 page_cache,
                 write_buffer: NZUsize!(1024),
                 replay_buffer: NZUsize!(1024),
+                max_open_blobs: None,
             },
             grafted_metadata_partition: format!("{partition_prefix}-grafted-metadata-partition"),
             translator: T::default(),

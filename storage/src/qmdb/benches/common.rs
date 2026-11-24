@@ -139,6 +139,7 @@ fn fix_log_cfg(suffix: &str, page_cache: CacheRef, items_per_blob: NonZeroU64) -
         page_cache,
         write_buffer: WRITE_BUFFER_SIZE,
         replay_buffer: REPLAY_BUFFER_SIZE,
+        max_open_blobs: None,
     }
 }
 

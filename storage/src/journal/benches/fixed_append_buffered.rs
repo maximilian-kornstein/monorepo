@@ -41,6 +41,7 @@ fn bench_size<const SIZE: usize>(c: &mut Criterion) {
                                 write_buffer: WRITE_BUFFER,
                                 replay_buffer: REPLAY_BUFFER,
                                 page_cache: cache.clone(),
+                                max_open_blobs: None,
                             },
                         )
                         .await

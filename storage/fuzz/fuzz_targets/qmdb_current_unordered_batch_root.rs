@@ -127,6 +127,7 @@ fn test_config(name: &str) -> Config<OneCap, Sequential> {
             write_buffer: NZUsize!(1024),
             replay_buffer: NZUsize!(1024),
             page_cache,
+            max_open_blobs: None,
         },
         grafted_metadata_partition: format!("{name}-grafted"),
         translator: OneCap,

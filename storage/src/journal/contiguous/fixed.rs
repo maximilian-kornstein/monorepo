@@ -41,8 +41,13 @@
 //!
 //! # Open Blobs
 //!
-//! Every retained blob is held open; a pruned blob stays open until the last snapshot holding it
-//! drops. Use a larger `items_per_blob` or prune to bound the count.
+//! By default every retained blob is held open; a pruned blob stays open until the last snapshot
+//! holding it drops. Setting [Config::max_open_blobs] instead opens sealed blobs on demand and
+//! keeps at most that many open, plus the tail and any blob a reader is still using. A blob is
+//! never opened twice: a reader that needs a blob another reader still holds shares that open.
+//! Before a blob is removed, every snapshot that may still read it is given an open handle, so
+//! snapshots keep reading pruned blobs as they do by default. Initialization still opens every
+//! retained blob once to recover it, and closes the excess before returning.
 //!
 //! # Partition
 //!
@@ -135,7 +140,7 @@
 
 use super::{
     Batch, Decoded,
-    blobs::{Blob, Blobs, Partition, Replay as BlobReplay, Writable},
+    blobs::{Blobs, Partition, Replay as BlobReplay, Writable},
     checkpoint::Checkpoint,
 };
 use crate::{
@@ -229,12 +234,21 @@ fn replay_stream<'a, B: RBlob, A: CodecFixedShared>(
             let offset = (first_pos - blob_first)
                 .checked_mul(A::SIZE as u64)
                 .ok_or(Error::OffsetOverflow)?;
-            let blob = blobs
-                .get(blob)
-                .expect("positions in bounds map to a retained blob");
 
+            // A blob the journal may close opens only when replay reaches it, so replay holds at
+            // most one such blob at a time.
+            let source = match blobs.get_held(blob) {
+                Some(handle) => Source::Ready(handle.replay_from(offset, buffer, read_options)?),
+                None => Source::Closed {
+                    blobs: blobs.clone(),
+                    blob,
+                    offset,
+                    buffer,
+                    read_options,
+                },
+            };
             states.push(FixedReplayState::<B, A> {
-                replay: blob.replay_from(offset, buffer, read_options)?,
+                source,
                 pos: first_pos,
                 end_pos: blob_end,
                 items_per_batch,
@@ -246,10 +260,48 @@ fn replay_stream<'a, B: RBlob, A: CodecFixedShared>(
     Ok(super::replay_stream_from_states(states))
 }
 
+/// Where a [FixedReplayState] reads its blob from.
+enum Source<'a, B: RBlob> {
+    /// Sequential logical bytes for this blob.
+    Ready(BlobReplay<'a, B>),
+    /// The blob was closed when replay started and opens when replay reaches it.
+    Closed {
+        blobs: Blobs<'a, B>,
+        blob: u64,
+        offset: u64,
+        buffer: NonZeroUsize,
+        read_options: ReadOptions,
+    },
+}
+
+impl<'a, B: RBlob> Source<'a, B> {
+    /// Return the blob's replay, opening the blob first if needed.
+    async fn replay(&mut self) -> Result<&mut BlobReplay<'a, B>, Error> {
+        if let Self::Closed {
+            blobs,
+            blob,
+            offset,
+            buffer,
+            read_options,
+        } = self
+        {
+            let handle = blobs
+                .resolve(*blob)
+                .await?
+                .expect("positions in bounds map to a retained blob");
+            *self = Self::Ready(handle.replay_from(*offset, *buffer, *read_options)?);
+        }
+        match self {
+            Self::Ready(replay) => Ok(replay),
+            Self::Closed { .. } => unreachable!("closed sources open above"),
+        }
+    }
+}
+
 /// Replay state for one fixed-size blob.
 struct FixedReplayState<'a, B: RBlob, A> {
-    /// Sequential logical bytes for this blob.
-    replay: BlobReplay<'a, B>,
+    /// The blob's replay.
+    source: Source<'a, B>,
     /// Next position to yield.
     pos: u64,
     /// Exclusive end position within this blob.
@@ -271,7 +323,14 @@ impl<B: RBlob, A: CodecFixedShared> super::BatchDecoder for FixedReplayState<'_,
         // Require at least one whole item so a short blob is reported as corruption at the
         // current position. Additional already-buffered items are decoded below.
         let start = self.pos;
-        match self.replay.ensure(A::SIZE).await {
+        let replay = match self.source.replay().await {
+            Ok(replay) => replay,
+            Err(err) => {
+                let decoded = Decoded::failed(start, Vec::new(), err);
+                return Some((decoded, self));
+            }
+        };
+        match replay.ensure(A::SIZE).await {
             Ok(true) => {}
             Ok(false) => {
                 let error = Error::Corruption(format!("blob ended before position {start}"));
@@ -286,7 +345,7 @@ impl<B: RBlob, A: CodecFixedShared> super::BatchDecoder for FixedReplayState<'_,
 
         // Decode only whole items that are already buffered, capped by the replay byte budget and
         // this blob's logical end.
-        let available = (self.replay.remaining() / A::SIZE) as u64;
+        let available = (replay.remaining() / A::SIZE) as u64;
         let remaining = self.end_pos - self.pos;
         let count = available.min(self.items_per_batch as u64).min(remaining) as usize;
 
@@ -297,9 +356,9 @@ impl<B: RBlob, A: CodecFixedShared> super::BatchDecoder for FixedReplayState<'_,
         // have consumed only part of a record.
         let mut items = Vec::with_capacity(count);
         while items.len() < count {
-            let n = (self.replay.chunk().len() / A::SIZE).min(count - items.len());
+            let n = (replay.chunk().len() / A::SIZE).min(count - items.len());
             if n > 0 {
-                let mut page = self.replay.copy_to_bytes(n * A::SIZE);
+                let mut page = replay.copy_to_bytes(n * A::SIZE);
                 for _ in 0..n {
                     match A::read(&mut page) {
                         Ok(item) => items.push(item),
@@ -310,7 +369,7 @@ impl<B: RBlob, A: CodecFixedShared> super::BatchDecoder for FixedReplayState<'_,
                     }
                 }
             } else {
-                match self.replay.read::<A>() {
+                match replay.read::<A>() {
                     Ok(item) => items.push(item),
                     Err(err) => {
                         let decoded = Decoded::failed(start, items, Error::Codec(err));
@@ -370,6 +429,14 @@ pub struct Config {
 
     /// Buffer size for sequential reads during recovery.
     pub replay_buffer: NonZeroUsize,
+
+    /// Maximum number of sealed blobs to keep open, or `None` to keep every retained blob open.
+    ///
+    /// When set, a sealed blob is opened when first read, and once more than this many are open
+    /// the journal closes one it has not read recently. The tail blob is always open, and a blob a
+    /// reader still holds stays open until the reader releases it. Reopening a blob costs a file
+    /// open and a read of its last page, and page cache entries from its earlier open go unused.
+    pub max_open_blobs: Option<NonZeroUsize>,
 }
 
 /// The journal's state, boxed so the public [Journal] handle stays pointer-sized.
@@ -958,7 +1025,13 @@ impl<E: Context, A: CodecFixedShared> Recovery<E, A> {
         let size = self.bounds.end;
         let items_per_blob = self.cfg.items_per_blob.get();
         let tail_blob = super::position_to_blob(size, items_per_blob);
-        let blobs = Writable::recover(self.partition, self.pending, tail_blob).await?;
+        let blobs = Writable::recover(
+            self.partition,
+            self.pending,
+            tail_blob,
+            self.cfg.max_open_blobs,
+        )
+        .await?;
 
         // A bounded open publishes the selected end after every retained blob is durable.
         if self.bounded && self.checkpoint.watermark() != Some(size) {
@@ -1872,7 +1945,8 @@ impl<E: Context, A: CodecFixedShared> Reader<'_, E, A> {
             let (blob_num, blob_offsets) = self.locate_group(group)?;
             let blob = self
                 .blobs
-                .get(blob_num)
+                .resolve(blob_num)
+                .await?
                 .expect("positions in bounds map to a retained blob");
             let (group_buf, rest) = remaining_buf.split_at_mut(group.len() * A::SIZE);
             remaining_buf = rest;
@@ -1901,17 +1975,13 @@ impl<E: Context, A: CodecFixedShared> Reader<'_, E, A> {
         Ok(result)
     }
 
-    /// Resolve `pos` to its blob and byte offset within the blob.
-    fn locate(&self, pos: u64) -> Result<(Blob<'_, E::Blob>, u64), Error> {
+    /// Resolve `pos` to its blob number and byte offset within the blob.
+    fn locate(&self, pos: u64) -> Result<(u64, u64), Error> {
         self.validate_readable(pos)?;
         let items_per_blob = self.items_per_blob.get();
         let blob = super::position_to_blob(pos, items_per_blob);
         let pos_in_blob = pos - first_in_blob(self.bounds.start, blob, items_per_blob)?;
         let offset = Inner::<E, A>::items_to_bytes(pos_in_blob)?;
-        let blob = self
-            .blobs
-            .get(blob)
-            .expect("position in bounds maps to a retained blob");
         Ok((blob, offset))
     }
 
@@ -1919,6 +1989,11 @@ impl<E: Context, A: CodecFixedShared> Reader<'_, E, A> {
     pub(super) async fn read_miss(&self, pos: u64) -> Result<A, Error> {
         let _timer = self.metrics.read_timer();
         let (blob, offset) = self.locate(pos)?;
+        let blob = self
+            .blobs
+            .resolve(blob)
+            .await?
+            .expect("position in bounds maps to a retained blob");
         self.metrics.cache_misses.inc();
         let bufs = blob.read_at(offset, A::SIZE).await?;
         let item = A::decode(bufs.coalesce()).map_err(Error::Codec)?;
@@ -2022,6 +2097,7 @@ impl<E: Context, A: CodecFixedShared> super::Contiguous for Reader<'_, E, A> {
 
     fn try_read_sync(&self, pos: u64) -> Option<A> {
         let (blob, offset) = self.locate(pos).ok()?;
+        let blob = self.blobs.get(blob)?;
         let item = decode_sync::<A>(|buf| blob.try_read_sync_into(buf, offset));
         if item.is_some() {
             self.metrics.cache_hits.inc();
@@ -2209,6 +2285,7 @@ impl<E: crate::Context, A: CodecFixedShared> Inner<E, A> {
             page_cache,
             write_buffer,
             replay_buffer: write_buffer,
+            max_open_blobs: None,
         };
         drop(self);
         let checkpoint = Checkpoint::open(context.child("meta"), &cfg.partition).await?;
@@ -2306,7 +2383,7 @@ mod tests {
         journal::{
             SYNC_READ_STACK_SIZE, authenticated,
             contiguous::{
-                Contiguous as _,
+                Contiguous,
                 tests::{assert_prune_target, replay_items, tear_page_rewrite},
             },
         },
@@ -2316,19 +2393,20 @@ mod tests {
     use commonware_cryptography::{Hasher as _, Sha256, sha256::Digest};
     use commonware_macros::test_traced;
     use commonware_runtime::{
-        Blob, Error as RuntimeError, Metrics as _, Runner, Spawner as _, Storage, Supervisor as _,
-        WriteOptions,
+        Blob, Clock as _, Error as RuntimeError, Metrics as _, Runner, Spawner as _, Storage,
+        Supervisor as _, WriteOptions,
         buffer::paged::{Writer, corrupt_page},
         deterministic::{self, Context},
         mocks::{
             DelayedSyncContext, MutationFaultContext, MutationFaults, PendingSyncs,
-            RecordingContext, WriteFaultContext, WriteFaults, drive_pending_syncs,
+            ReadGateContext, RecordingContext, WriteFaultContext, WriteFaults, drive_pending_syncs,
             fail_pending_syncs, next_pending_sync, release_pending_syncs,
         },
     };
-    use commonware_utils::{NZU16, NZU64, NZUsize, probability};
+    use commonware_utils::{NZU16, NZU64, NZUsize, TestRng, probability, test_rng};
     use futures::{StreamExt, pin_mut};
-    use std::num::NonZeroU16;
+    use rand::RngExt as _;
+    use std::{num::NonZeroU16, time::Duration};
 
     const PAGE_SIZE: NonZeroU16 = NZU16!(44);
     const PAGE_CACHE_SIZE: NonZeroUsize = NZUsize!(3);
@@ -2345,6 +2423,7 @@ mod tests {
             page_cache: CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
             write_buffer: NZUsize!(2048),
             replay_buffer: NZUsize!(2048),
+            max_open_blobs: None,
         }
     }
 
@@ -2362,6 +2441,7 @@ mod tests {
                 page_cache: cache.clone(),
                 write_buffer: NZUsize!(128),
                 replay_buffer: NZUsize!(128),
+                max_open_blobs: None,
             };
             let (blob, size) = context
                 .open("initialization-extra-tail-blobs", &0u64.to_be_bytes())
@@ -4148,21 +4228,24 @@ mod tests {
             assert!(pending.try_snapshot().is_none());
 
             for source in [
-                super::super::blobs::Blob::Sealed(snapshot),
+                super::super::blobs::Blob::Sealed(snapshot, None),
                 super::super::blobs::Blob::Writer(&writer),
                 super::super::blobs::Blob::Writer(&pending),
             ] {
                 let mut state = FixedReplayState::<_, View> {
-                    replay: source
-                        .replay_from(0, NZUsize!(256), ReadOptions::DONT_CACHE)
-                        .unwrap(),
+                    source: Source::Ready(
+                        source
+                            .replay_from(0, NZUsize!(256), ReadOptions::DONT_CACHE)
+                            .unwrap(),
+                    ),
                     pos: 0,
                     end_pos: 16,
                     items_per_batch: 32,
                     _marker: PhantomData,
                 };
-                assert!(state.replay.ensure(View::SIZE).await.unwrap());
-                let first_chunk = state.replay.chunk();
+                let replay = state.source.replay().await.unwrap();
+                assert!(replay.ensure(View::SIZE).await.unwrap());
+                let first_chunk = replay.chunk();
                 let source = first_chunk.as_ptr() as usize;
                 let count = first_chunk.len() / View::SIZE;
                 let batch = {
@@ -4205,6 +4288,7 @@ mod tests {
                     page_cache: CacheRef::new(NZU16!(PAGE as u16), NZUsize!(4)),
                     write_buffer: NZUsize!(2048),
                     replay_buffer: NZUsize!(2048),
+                    max_open_blobs: None,
                 };
                 let mut journal = Journal::<_, u64>::init(context.child("write"), cfg.clone())
                     .await
@@ -5481,6 +5565,7 @@ mod tests {
                 page_cache: CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
                 write_buffer: NZUsize!(1),
                 replay_buffer: NZUsize!(2048),
+                max_open_blobs: None,
             }
         }
         let appended: Vec<Digest> = (100..105u64).map(test_digest).collect();
@@ -5561,6 +5646,7 @@ mod tests {
                 page_cache: CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
                 write_buffer: NZUsize!(1),
                 replay_buffer: NZUsize!(2048),
+                max_open_blobs: None,
             }
         }
 
@@ -5843,6 +5929,7 @@ mod tests {
                 page_cache: CacheRef::new(NZU16!(LOGICAL_PAGE_SIZE as u16), NZUsize!(4)),
                 write_buffer: NZUsize!(128),
                 replay_buffer: NZUsize!(128),
+                max_open_blobs: None,
             };
             let partition = blob_partition(&cfg);
             let (blob, size) = context.open(&partition, &0u64.to_be_bytes()).await.unwrap();
@@ -5989,6 +6076,7 @@ mod tests {
                 page_cache: CacheRef::new(NZU16!(LOGICAL_PAGE_SIZE as u16), NZUsize!(4)),
                 write_buffer: NZUsize!(128),
                 replay_buffer: NZUsize!(128),
+                max_open_blobs: None,
             };
             let mut journal = Journal::<_, u64>::init(context.child("first"), cfg.clone())
                 .await
@@ -6141,6 +6229,7 @@ mod tests {
                 page_cache: CacheRef::new(NZU16!(PAGE as u16), NZUsize!(3)),
                 write_buffer: NZUsize!(2048),
                 replay_buffer: NZUsize!(2048),
+                max_open_blobs: None,
             };
             let mut journal = Journal::<_, Digest>::init(context.child("first"), cfg.clone())
                 .await
@@ -6645,6 +6734,7 @@ mod tests {
             page_cache: CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
             write_buffer: NZUsize!(2048),
             replay_buffer: NZUsize!(2048),
+            max_open_blobs: None,
         }
     }
 
@@ -8842,6 +8932,7 @@ mod tests {
                 page_cache: CacheRef::new(NZU16!(PAGE as u16), NZUsize!(3)),
                 write_buffer: NZUsize!(2048),
                 replay_buffer: NZUsize!(2048),
+                max_open_blobs: None,
             };
             let mut journal = Journal::<_, Digest>::init(context.child("first"), cfg.clone())
                 .await
@@ -8910,6 +9001,413 @@ mod tests {
             assert_eq!(journal.bounds(), 0..33);
             for i in 0..33u64 {
                 assert_eq!(journal.read(i).await.unwrap(), test_digest(i));
+            }
+            journal.destroy().await.unwrap();
+        });
+    }
+
+    fn bounded_cfg(items_per_blob: NonZeroU64, max_open_blobs: usize) -> Config {
+        Config {
+            max_open_blobs: NonZeroUsize::new(max_open_blobs),
+            ..test_cfg(items_per_blob)
+        }
+    }
+
+    /// Open blob handles across the runtime, the checkpoint's metadata blobs included.
+    fn open_blobs(context: &Context) -> u64 {
+        counter(&context.encode(), "runtime_open_blobs")
+    }
+
+    /// Blob indices stored in the journal's blob partition.
+    async fn stored_blobs(context: &Context, cfg: &Config) -> Vec<u64> {
+        let mut blobs: Vec<u64> = scan_partition(context, &blob_partition(cfg))
+            .await
+            .into_iter()
+            .map(|name| u64::from_be_bytes(name.try_into().unwrap()))
+            .collect();
+        blobs.sort_unstable();
+        blobs
+    }
+
+    /// Read every item in `range` through a replay stream of `reader`.
+    async fn assert_replays<R: Contiguous<Item = Digest>>(reader: &R, range: Range<u64>) {
+        let stream = reader
+            .replay(range.clone(), NZUsize!(64), ReadOptions::default())
+            .await
+            .unwrap();
+        pin_mut!(stream);
+        let mut next = range.start;
+        while let Some(batch) = stream.next().await {
+            for (pos, item) in batch.unwrap() {
+                assert_eq!(pos, next);
+                assert_eq!(item, test_digest(pos));
+                next += 1;
+            }
+        }
+        assert_eq!(next, range.end);
+    }
+
+    /// With a limit, the journal keeps at most that many sealed blobs open while every item stays
+    /// readable through point reads, batched reads, snapshots, and replay.
+    #[test_traced]
+    fn test_max_open_blobs_bounds_open_blobs() {
+        const MAX_OPEN: usize = 4;
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = bounded_cfg(NZU64!(3), MAX_OPEN);
+            let mut journal = Journal::<_, Digest>::init(context.child("j"), cfg.clone())
+                .await
+                .unwrap();
+
+            // The tail and the checkpoint's metadata blobs are open from the start.
+            let limit = open_blobs(&context) + MAX_OPEN as u64;
+            let items = 40 * 3 + 1;
+            for i in 0..items {
+                (journal, _) = journal.append(&test_digest(i)).await.unwrap();
+                assert!(open_blobs(&context) <= limit);
+            }
+            journal = journal.sync().await.unwrap();
+            assert_eq!(journal.test_newest_blob(), Some(40));
+
+            let mut rng = test_rng();
+            for _ in 0..500 {
+                let pos = rng.random_range(0..items);
+                assert_eq!(journal.read(pos).await.unwrap(), test_digest(pos));
+                assert!(open_blobs(&context) <= limit);
+            }
+
+            // A batch spanning every blob holds them while it reads and releases them after.
+            let positions: Vec<u64> = (0..items).step_by(2).collect();
+            let read = journal.read_many(&positions).await.unwrap();
+            for (&pos, item) in positions.iter().zip(&read) {
+                assert_eq!(*item, test_digest(pos));
+            }
+            assert!(open_blobs(&context) <= limit);
+
+            // Snapshot reads share the journal's limit.
+            let snapshot;
+            (journal, snapshot) = journal.snapshot().await.unwrap();
+            for _ in 0..500 {
+                let pos = rng.random_range(0..items);
+                assert_eq!(snapshot.read(pos).await.unwrap(), test_digest(pos));
+                assert!(open_blobs(&context) <= limit);
+            }
+
+            // Replay opens one closed blob at a time.
+            assert_replays(&journal, 0..items).await;
+            assert_replays(&snapshot, 1..items - 1).await;
+            assert!(open_blobs(&context) <= limit);
+
+            drop(snapshot);
+            journal.destroy().await.unwrap();
+            assert_eq!(open_blobs(&context), 0);
+        });
+    }
+
+    /// Reopening a journal holding many more blobs than the limit leaves only the limit open, and
+    /// every item recovers.
+    #[test_traced]
+    fn test_max_open_blobs_recovery() {
+        const MAX_OPEN: usize = 3;
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = bounded_cfg(NZU64!(4), MAX_OPEN);
+            let mut journal = Journal::<_, Digest>::init(context.child("first"), cfg.clone())
+                .await
+                .unwrap();
+            let limit = open_blobs(&context) + MAX_OPEN as u64;
+            let items = 30 * 4 + 2;
+            for i in 0..items {
+                (journal, _) = journal.append(&test_digest(i)).await.unwrap();
+            }
+            journal = journal.sync().await.unwrap();
+            drop(journal);
+            assert_eq!(open_blobs(&context), 0);
+
+            // An unbounded open holds every blob.
+            let journal = Journal::<_, Digest>::init(
+                context.child("unbounded"),
+                Config {
+                    max_open_blobs: None,
+                    ..cfg.clone()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(open_blobs(&context) > limit);
+            drop(journal);
+
+            let journal = Journal::<_, Digest>::init(context.child("bounded"), cfg.clone())
+                .await
+                .unwrap();
+            assert_eq!(journal.bounds(), 0..items);
+            assert!(open_blobs(&context) <= limit);
+            let mut rng = TestRng::new(3);
+            for _ in 0..300 {
+                let pos = rng.random_range(0..items);
+                assert_eq!(journal.read(pos).await.unwrap(), test_digest(pos));
+                assert!(open_blobs(&context) <= limit);
+            }
+            assert_replays(&journal, 0..items).await;
+            assert!(open_blobs(&context) <= limit);
+            journal.destroy().await.unwrap();
+        });
+    }
+
+    /// Pruning closed blobs removes them without reopening them, except for blobs a live snapshot
+    /// may still read: the snapshot, and replay streams it started, keep reading them.
+    #[test_traced]
+    fn test_max_open_blobs_prune_under_snapshot() {
+        const MAX_OPEN: usize = 2;
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = bounded_cfg(NZU64!(3), MAX_OPEN);
+            let mut journal = Journal::<_, Digest>::init(context.child("j"), cfg.clone())
+                .await
+                .unwrap();
+            let limit = open_blobs(&context) + MAX_OPEN as u64;
+            let items = 20 * 3 + 1;
+            for i in 0..items {
+                (journal, _) = journal.append(&test_digest(i)).await.unwrap();
+            }
+
+            // A snapshot and a replay stream from it, both started before the prune.
+            let snapshot;
+            (journal, snapshot) = journal.snapshot().await.unwrap();
+            {
+                let stream = snapshot
+                    .replay(0..items, NZUsize!(64), ReadOptions::default())
+                    .await
+                    .unwrap();
+                pin_mut!(stream);
+                assert_eq!(snapshot.read(7).await.unwrap(), test_digest(7));
+
+                let pruned;
+                (journal, pruned) = journal.prune(45).await.unwrap();
+                assert!(pruned);
+                assert_eq!(journal.bounds(), 45..items);
+                assert_eq!(
+                    stored_blobs(&context, &cfg).await,
+                    (15..=20).collect::<Vec<_>>()
+                );
+                assert!(matches!(journal.read(3).await, Err(Error::ItemPruned(3))));
+
+                // The snapshot and its stream read the pruned range.
+                for pos in 0..items {
+                    assert_eq!(snapshot.read(pos).await.unwrap(), test_digest(pos));
+                }
+                let mut next = 0;
+                while let Some(batch) = stream.next().await {
+                    for (pos, item) in batch.unwrap() {
+                        assert_eq!(pos, next);
+                        assert_eq!(item, test_digest(pos));
+                        next += 1;
+                    }
+                }
+                assert_eq!(next, items);
+            }
+            drop(snapshot);
+
+            // No read recreated a removed blob, and the pinned blobs close with their readers.
+            assert_eq!(
+                stored_blobs(&context, &cfg).await,
+                (15..=20).collect::<Vec<_>>()
+            );
+            assert!(open_blobs(&context) <= limit);
+
+            let fresh;
+            (journal, fresh) = journal.snapshot().await.unwrap();
+            assert_eq!(fresh.bounds(), 45..items);
+            assert_replays(&fresh, 45..items).await;
+            drop(fresh);
+            journal.destroy().await.unwrap();
+        });
+    }
+
+    /// A bounded reopen (rewind) and a clear across closed blobs keep the limit, keep every
+    /// retained item readable, and leave no stray blob behind.
+    #[test_traced]
+    fn test_max_open_blobs_rewind_and_clear() {
+        const MAX_OPEN: usize = 2;
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = bounded_cfg(NZU64!(3), MAX_OPEN);
+            let mut journal = Journal::<_, Digest>::init(context.child("first"), cfg.clone())
+                .await
+                .unwrap();
+            let limit = open_blobs(&context) + MAX_OPEN as u64;
+            for i in 0..91u64 {
+                (journal, _) = journal.append(&test_digest(i)).await.unwrap();
+            }
+            journal = journal.sync().await.unwrap();
+            drop(journal);
+
+            // Rewind to the middle of blob 13.
+            let mut journal =
+                Journal::<_, Digest>::init_at_most(context.child("rewound"), cfg.clone(), 40)
+                    .await
+                    .unwrap();
+            assert_eq!(journal.bounds(), 0..40);
+            assert!(open_blobs(&context) <= limit);
+            assert_eq!(
+                stored_blobs(&context, &cfg).await,
+                (0..=13).collect::<Vec<_>>()
+            );
+            for i in 40..70u64 {
+                (journal, _) = journal.append(&test_digest(i)).await.unwrap();
+                assert!(open_blobs(&context) <= limit);
+            }
+            for pos in (0..70).rev() {
+                assert_eq!(journal.read(pos).await.unwrap(), test_digest(pos));
+            }
+            assert!(open_blobs(&context) <= limit);
+
+            // A snapshot taken before a clear still reads every cleared item.
+            let snapshot;
+            (journal, snapshot) = journal.snapshot().await.unwrap();
+            journal = journal.clear_to_size(200).await.unwrap();
+            assert_eq!(journal.bounds(), 200..200);
+            assert_eq!(stored_blobs(&context, &cfg).await, vec![66]);
+            assert_replays(&snapshot, 0..70).await;
+            drop(snapshot);
+            assert_eq!(stored_blobs(&context, &cfg).await, vec![66]);
+
+            for i in 200..220u64 {
+                (journal, _) = journal.append(&test_digest(i)).await.unwrap();
+            }
+            assert_replays(&journal, 200..220).await;
+            assert!(open_blobs(&context) <= limit);
+            journal.destroy().await.unwrap();
+        });
+    }
+
+    /// A snapshot's view of the tail keeps that open alive after the tail is sealed and leaves the
+    /// journal's open set, so the journal shares it instead of opening the blob again.
+    #[test_traced]
+    fn test_max_open_blobs_sealed_tail_under_snapshot() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = bounded_cfg(NZU64!(3), 1);
+            let mut journal = Journal::<_, Digest>::init(context.child("j"), cfg)
+                .await
+                .unwrap();
+            for i in 0..2u64 {
+                (journal, _) = journal.append(&test_digest(i)).await.unwrap();
+            }
+            let snapshot;
+            (journal, snapshot) = journal.snapshot().await.unwrap();
+
+            // Seal blob 0, then read later blobs so the journal stops keeping blob 0 open.
+            for i in 2..15u64 {
+                (journal, _) = journal.append(&test_digest(i)).await.unwrap();
+            }
+            for pos in [4, 7, 10] {
+                assert_eq!(journal.read(pos).await.unwrap(), test_digest(pos));
+            }
+            for pos in 0..15 {
+                assert_eq!(journal.read(pos).await.unwrap(), test_digest(pos));
+            }
+            for pos in 0..2 {
+                assert_eq!(snapshot.read(pos).await.unwrap(), test_digest(pos));
+            }
+            drop(snapshot);
+            assert_eq!(journal.read(0).await.unwrap(), test_digest(0));
+            journal.destroy().await.unwrap();
+        });
+    }
+
+    /// Readers of a closed blob share one open: a reader waits for an open in progress instead of
+    /// opening the blob again, and cancelling the open releases the blob.
+    #[test_traced]
+    fn test_max_open_blobs_shared_open_is_cancel_safe() {
+        type Gated = ReadGateContext<deterministic::Context>;
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = bounded_cfg(NZU64!(3), 1);
+            let (gated, gate) = ReadGateContext::new(context.child("gated"), blob_partition(&cfg));
+            let mut journal = Journal::<Gated, Digest>::init(gated, cfg).await.unwrap();
+            for i in 0..12u64 {
+                (journal, _) = journal.append(&test_digest(i)).await.unwrap();
+            }
+            journal = journal.sync().await.unwrap();
+            let snapshot;
+            (journal, snapshot) = journal.snapshot().await.unwrap();
+
+            // The first reader parks while opening closed blob 0.
+            gate.arm();
+            let mut first = Box::pin(journal.read(0));
+            assert!(first.as_mut().now_or_never().is_none());
+            assert_eq!(gate.blocked(), 1);
+
+            // A second reader of blob 0 waits for that open without touching storage.
+            let mut second = Box::pin(snapshot.read(1));
+            assert!(second.as_mut().now_or_never().is_none());
+            assert_eq!(gate.blocked(), 1);
+
+            // Cancelling the parked open releases the blob, so the waiting reader opens it.
+            drop(first);
+            gate.disarm();
+            assert_eq!(second.await.unwrap(), test_digest(1));
+            assert_eq!(journal.read(0).await.unwrap(), test_digest(0));
+            drop(snapshot);
+            journal.destroy().await.unwrap();
+        });
+    }
+
+    /// Snapshot readers in concurrent tasks keep reading the right items while the writer rolls
+    /// and prunes the blobs they read.
+    #[test_traced]
+    fn test_max_open_blobs_concurrent_readers() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let cfg = bounded_cfg(NZU64!(2), 2);
+            let mut journal = Journal::<_, Digest>::init(context.child("j"), cfg.clone())
+                .await
+                .unwrap();
+            for i in 0..40u64 {
+                (journal, _) = journal.append(&test_digest(i)).await.unwrap();
+            }
+
+            let mut readers = Vec::new();
+            for round in 0..3u64 {
+                let snapshot;
+                (journal, snapshot) = journal.snapshot().await.unwrap();
+                let snapshot = Arc::new(snapshot);
+                for task in 0..4u64 {
+                    let snapshot = snapshot.clone();
+                    readers.push(context.child("reader").spawn(move |context| async move {
+                        let bounds = snapshot.bounds();
+                        let mut rng = TestRng::new(round * 4 + task);
+                        for _ in 0..50 {
+                            let pos = rng.random_range(bounds.clone());
+                            assert_eq!(snapshot.read(pos).await.unwrap(), test_digest(pos));
+                            context.sleep(Duration::from_millis(1)).await;
+                        }
+                    }));
+                }
+
+                // Roll and prune while the readers run.
+                for _ in 0..20 {
+                    let pos = journal.size();
+                    (journal, _) = journal.append(&test_digest(pos)).await.unwrap();
+                    context.sleep(Duration::from_millis(1)).await;
+                }
+                let floor = journal.size() - 30;
+                (journal, _) = journal.prune(floor).await.unwrap();
+            }
+            for reader in readers {
+                reader.await.unwrap();
+            }
+
+            let bounds = journal.bounds();
+            let oldest = journal.test_oldest_blob().unwrap();
+            let newest = journal.test_newest_blob().unwrap();
+            assert_eq!(
+                stored_blobs(&context, &cfg).await,
+                (oldest..=newest).collect::<Vec<_>>()
+            );
+            for pos in bounds {
+                assert_eq!(journal.read(pos).await.unwrap(), test_digest(pos));
             }
             journal.destroy().await.unwrap();
         });

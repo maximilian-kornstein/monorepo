@@ -103,6 +103,7 @@ fn test_config(test_name: &str) -> Config<TwoCap, Sequential> {
             write_buffer: NZUsize!(1024),
             replay_buffer: NZUsize!(1024),
             page_cache,
+            max_open_blobs: None,
         },
         translator: TwoCap,
         init_cache: Some(NZUsize!(3)),

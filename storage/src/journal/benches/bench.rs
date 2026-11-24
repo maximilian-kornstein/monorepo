@@ -17,6 +17,7 @@ use std::num::{NonZeroU16, NonZeroU64, NonZeroUsize};
 mod append_sync;
 mod fixed_append;
 mod fixed_append_buffered;
+mod fixed_read_blobs;
 mod fixed_read_random;
 mod fixed_read_sequential;
 mod fixed_replay;
@@ -34,6 +35,7 @@ criterion_main!(
     append_sync::benches,
     fixed_append::benches,
     fixed_append_buffered::benches,
+    fixed_read_blobs::benches,
     fixed_read_random::benches,
     fixed_read_sequential::benches,
     fixed_replay::benches,
@@ -77,6 +79,7 @@ async fn get_fixed_journal<const ITEM_SIZE: usize>(
         write_buffer: WRITE_BUFFER,
         replay_buffer: REPLAY_BUFFER,
         page_cache: CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
+        max_open_blobs: None,
     };
     FixedJournal::init(context, journal_config).await.unwrap()
 }

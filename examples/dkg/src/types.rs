@@ -579,6 +579,7 @@ pub fn db_config(prefix: &str, page_cache: CacheRef) -> fixed::Config<TwoCap, Se
             page_cache,
             write_buffer: IO_BUFFER_SIZE,
             replay_buffer: IO_BUFFER_SIZE,
+            max_open_blobs: None,
         },
         translator: TwoCap,
         init_cache: Some(NZUsize!(1024)),

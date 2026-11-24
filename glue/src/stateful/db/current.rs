@@ -455,6 +455,7 @@ mod tests {
                 page_cache,
                 write_buffer: NZUsize!(1024),
                 replay_buffer: NZUsize!(1024),
+                max_open_blobs: None,
             },
             grafted_metadata_partition: format!("stateful-current-grafted-{suffix}"),
             translator: TwoCap,

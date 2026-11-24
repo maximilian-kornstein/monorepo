@@ -759,6 +759,7 @@ fn any_config(suffix: &str) -> any::Config<TwoCap, FixedJournalConfig, Sequentia
             page_cache,
             write_buffer: NZUsize!(1024),
             replay_buffer: NZUsize!(1024),
+            max_open_blobs: None,
         },
         translator: TwoCap,
         init_cache: Some(NZUsize!(1024)),

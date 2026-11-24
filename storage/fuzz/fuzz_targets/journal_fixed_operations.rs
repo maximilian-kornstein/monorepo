@@ -151,6 +151,7 @@ fn fuzz(input: FuzzInput) {
             write_buffer: NZUsize!(MAX_WRITE_BUF),
             replay_buffer: NZUsize!(MAX_WRITE_BUF),
             page_cache: CacheRef::new(PAGE_SIZE, NZUsize!(PAGE_CACHE_SIZE)),
+            max_open_blobs: None,
         };
 
         let mut journal = Journal::init(context.child("storage"), cfg.clone())

@@ -295,6 +295,7 @@ mod tests {
             write_buffer: NZUsize!(1024),
             replay_buffer: NZUsize!(1024),
             page_cache: CacheRef::new(NZU16!(111), NZUsize!(5)),
+            max_open_blobs: None,
         }
     }
 

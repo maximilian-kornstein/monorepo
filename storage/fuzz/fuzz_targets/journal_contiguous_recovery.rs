@@ -451,6 +451,7 @@ impl FuzzJournal for FixedJournal<deterministic::Context, Item> {
             ),
             write_buffer: params.write_buffer,
             replay_buffer: params.replay_buffer,
+            max_open_blobs: None,
         }
     }
 

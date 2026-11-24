@@ -75,6 +75,7 @@ mod tests {
                 page_cache,
                 write_buffer: NZUsize!(1024),
                 replay_buffer: NZUsize!(1024),
+                max_open_blobs: None,
             },
             init_concurrency: NZUsize!(2),
         }
@@ -1444,6 +1445,7 @@ mod tests {
                     page_cache: CacheRef::new(page_size, PAGE_CACHE_SIZE),
                     write_buffer: NZUsize!(1024),
                     replay_buffer: NZUsize!(1024),
+                    max_open_blobs: None,
                 },
                 init_concurrency: NZUsize!(2),
             }

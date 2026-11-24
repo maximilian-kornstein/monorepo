@@ -339,6 +339,7 @@ impl<F: Family, E: Context, D: Digest, S: Strategy> Merkle<F, E, D, S> {
             page_cache: cfg.page_cache,
             write_buffer: cfg.write_buffer,
             replay_buffer: cfg.replay_buffer,
+            max_open_blobs: None,
         };
 
         // A pruned journal with no persisted boundary lost its pins with the metadata. A destroy
@@ -513,6 +514,7 @@ impl<F: Family, E: Context, D: Digest, S: Strategy> Merkle<F, E, D, S> {
                 write_buffer: cfg.config.write_buffer,
                 replay_buffer: cfg.config.replay_buffer,
                 page_cache: cfg.config.page_cache,
+                max_open_blobs: None,
             },
             *journal_probe,
             *end_pos,
@@ -2142,6 +2144,7 @@ mod tests {
                     write_buffer: NZUsize!(1024),
                     replay_buffer: NZUsize!(1024),
                     page_cache: CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
+                    max_open_blobs: None,
                 },
             )
             .await
@@ -5040,6 +5043,7 @@ mod tests {
             page_cache: cfg.page_cache.clone(),
             write_buffer: cfg.write_buffer,
             replay_buffer: cfg.replay_buffer,
+            max_open_blobs: None,
         };
         let journal =
             Journal::<_, Digest>::init(context.child("interrupted_reset"), journal_cfg.clone())
@@ -5740,6 +5744,7 @@ mod tests {
                     write_buffer: NZUsize!(1024),
                     replay_buffer: NZUsize!(1024),
                     page_cache: CacheRef::new(PAGE_SIZE, PAGE_CACHE_SIZE),
+                    max_open_blobs: None,
                 },
             )
             .await

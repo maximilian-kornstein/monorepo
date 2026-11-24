@@ -311,6 +311,7 @@ fn config<E: Strategizer>(ctx: &E, args: &Args) -> AnyConfig<EightCap, Rayon> {
             page_cache,
             write_buffer: WRITE_BUFFER,
             replay_buffer: REPLAY_BUFFER,
+            max_open_blobs: None,
         },
         translator: EightCap,
         init_cache: Some(NZUsize!(1 << 20)),

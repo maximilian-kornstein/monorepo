@@ -162,6 +162,7 @@ fn test_config(name: &str, page_cache: CacheRef) -> Config<TwoCap, Sequential> {
             write_buffer: NZUsize!(WRITE_BUFFER_SIZE),
             replay_buffer: NZUsize!(WRITE_BUFFER_SIZE),
             page_cache,
+            max_open_blobs: None,
         },
         grafted_metadata_partition: format!("fuzz-current-mmb-pruning-{name}-grafted-metadata"),
         translator: TwoCap,

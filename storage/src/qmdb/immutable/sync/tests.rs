@@ -461,6 +461,7 @@ pub(crate) mod harnesses {
                 page_cache,
                 write_buffer: NZUsize!(1024),
                 replay_buffer: NZUsize!(1024),
+                max_open_blobs: None,
             },
             translator: TwoCap,
             init_buffer: NZUsize!(1 << 21),

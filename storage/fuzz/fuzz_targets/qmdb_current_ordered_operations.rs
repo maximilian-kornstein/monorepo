@@ -191,6 +191,7 @@ fn fuzz_family<F: Graftable>(data: &FuzzInput, suffix: &str) {
                 write_buffer: NZUsize!(WRITE_BUFFER_SIZE),
                 replay_buffer: NZUsize!(WRITE_BUFFER_SIZE),
                 page_cache,
+                max_open_blobs: None,
             },
             grafted_metadata_partition: format!("fuzz-current-ord-{suffix}-grafted-merkle-metadata"),
             translator: TwoCap,

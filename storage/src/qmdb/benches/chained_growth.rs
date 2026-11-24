@@ -68,6 +68,7 @@ fn fix_log_cfg(pc: CacheRef) -> FConfig {
         page_cache: pc,
         write_buffer: WRITE_BUFFER_SIZE,
         replay_buffer: REPLAY_BUFFER_SIZE,
+        max_open_blobs: None,
     }
 }
 
